@@ -1,0 +1,75 @@
+# =====================================================================
+# PROTEINS experiment configuration
+# =====================================================================
+
+experiment:
+  name: proteins_sim_ged
+  seed: 42
+  device: cuda
+  output_dir: checkpoints/proteins/
+
+# ---------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------
+dataset:
+  name: PROTEINS
+  type: graph_classification
+  source: torch_geometric.datasets.TUDataset
+  root: data/
+  ged_path: data/proteins_ged.pt        # auto-regenerated if missing
+  num_classes: 2
+  split:
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+
+# ---------------------------------------------------------------------
+# Explainee model (the model to be explained)
+# ---------------------------------------------------------------------
+explainee:
+  model_name: gin
+  hidden_dim: 64          # increased due to larger graphs
+  num_layers: 3
+  dropout: 0.3
+  lr: 1e-3
+  batch_size: 64
+  epochs: 60
+  optimizer: adam
+  save_path: models/explainees/gin_proteins.pt
+  checkpoint_dir: checkpoints/explainees/
+
+# ---------------------------------------------------------------------
+# Distance approximator (SimGNN or alternative)
+# ---------------------------------------------------------------------
+distance_model:
+  model_name: simgnn
+  hidden_dim: 128
+  tensor_channels: 8
+  use_tensor: true
+  lr: 1e-3
+  batch_size: 64
+  epochs: 50
+  alpha: 0.5
+  data_path: data/proteins_ged.pt
+  save_path: models/distances/simgnn_proteins.pt
+  checkpoint_dir: checkpoints/distances/
+
+# ---------------------------------------------------------------------
+# Generator (to be trained later)
+# ---------------------------------------------------------------------
+generator:
+  model_name: gnn_egg
+  hidden_dim: 128
+  lr: 1e-3
+  epochs: 100
+  distance_metric: simgnn
+  save_path: models/generators/gnn_egg_proteins.pt
+  checkpoint_dir: checkpoints/generators/
+
+# ---------------------------------------------------------------------
+# Logging / evaluation options
+# ---------------------------------------------------------------------
+logging:
+  eval_every: 5
+  save_best_only: true
+  verbose: true

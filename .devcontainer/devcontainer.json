@@ -1,0 +1,25 @@
+{
+    "name": "${localWorkspaceFolderBasename}",
+    "dockerComposeFile": "docker-compose.yml", 
+    "service": "devcontainer",
+    "workspaceFolder": "/repo", 
+    "customizations": {
+        "vscode": {
+            "extensions": [
+                "ms-python.python", 
+                "ms-python.vscode-pylance", 
+                "ms-toolsai.jupyter", 
+                "streetsidesoftware.code-spell-checker", 
+                "christian-kohler.path-intellisense", 
+                "pascalsenn.keyboard-quickfix" 
+            ], 
+            "settings": {
+                "python.terminal.launchArgs": [
+                    "-m",
+                    "IPython",
+                    "--no-autoindent"
+                ]
+            }
+        }
+    }
+}

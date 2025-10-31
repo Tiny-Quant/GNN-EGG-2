@@ -1,0 +1,76 @@
+# =====================================================================
+# MUTAG experiment configuration
+# =====================================================================
+
+experiment:
+  name: mutag_sim_ged
+  seed: 42
+  device: cuda
+  output_dir: checkpoints/mutag/
+
+# ---------------------------------------------------------------------
+# Dataset
+# ---------------------------------------------------------------------
+dataset:
+  name: MUTAG
+  type: graph_classification
+  source: torch_geometric.datasets.TUDataset
+  root: data/
+  ged_path: data/mutag_ged.pt        # auto-regenerated if missing
+  num_classes: 2
+  split:
+    train_ratio: 0.8
+    val_ratio: 0.1
+    test_ratio: 0.1
+
+# ---------------------------------------------------------------------
+# Explainee model
+# ---------------------------------------------------------------------
+explainee:
+  model_name: gin
+  hidden_dim: 32
+  num_layers: 2
+  dropout: 0.2
+  lr: 1e-3
+  batch_size: 32
+  epochs: 50
+  optimizer: adam
+  save_path: models/explainees/gin_mutag.pt
+  checkpoint_dir: checkpoints/explainees/
+
+# ---------------------------------------------------------------------
+# Distance approximator (SimGNN)
+# ---------------------------------------------------------------------
+distance_model:
+  model_name: simgnn
+  hidden_dim: 64
+  tensor_channels: 8
+  use_tensor: true
+  lr: 1e-3
+  batch_size: 32
+  epochs: 40
+  alpha: 0.5
+  data_path: data/mutag_ged.pt       # same as dataset.ged_path
+  save_path: models/distances/simgnn_mutag.pt
+  checkpoint_dir: checkpoints/distances/
+
+# ---------------------------------------------------------------------
+# Generator (to be trained later)
+# ---------------------------------------------------------------------
+generator:
+  lr: 1e-3
+  steps: 2000
+  batch_size: 1
+  temperature: 1.0
+  symmetric_adj: true
+  allow_self_loops: false
+  save_path: "checkpoints/generators/generator-classX.pt"
+
+
+# ---------------------------------------------------------------------
+# Logging / evaluation
+# ---------------------------------------------------------------------
+logging:
+  eval_every: 5
+  save_best_only: true
+  verbose: true

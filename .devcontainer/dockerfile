@@ -1,0 +1,59 @@
+# Base Image.
+FROM nvidia/cuda:12.4.1-cudnn-runtime-ubuntu22.04
+
+# Set working directory name. 
+WORKDIR /repo
+
+# Install linux tools. 
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && \
+    apt-get upgrade -y && \
+    apt-get install -y --no-install-recommends \
+    build-essential bash wget vim \
+    coreutils findutils \
+    # For cv2
+    ffmpeg libsm6 libxext6 \
+    bzip2 ca-certificates unzip locales && \
+    locale-gen en_US.UTF-8 && \
+    update-locale LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8 && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/* 
+
+# Install miniconda. 
+RUN wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh \
+    -O /tmp/miniconda.sh && \
+    bash /tmp/miniconda.sh -b -p /opt/miniconda && \
+    rm /tmp/miniconda.sh
+ENV PATH=/opt/miniconda/bin:$PATH
+RUN pip install --upgrade pip
+RUN conda init bash
+
+# Create conda python environment.
+COPY egg-env-38.yml /tmp/egg-env-38.yml
+RUN conda env create -f /tmp/egg-env-38.yml && \
+    conda clean --all --yes && \ 
+    echo "conda activate egg-env-38" >> ~/.bashrc
+ENV PATH=/opt/miniconda/envs/egg-env-38/bin:$PATH
+RUN pip install \ 
+    pyg_lib torch_scatter torch_sparse torch_cluster torch_spline_conv \
+    -f https://data.pyg.org/whl/torch-2.4.0+cu124.html
+RUN pip install ray[tune] ipywidgets
+
+# Set environment variables for locale
+ENV LANG=en_US.UTF-8
+ENV LANGUAGE=en_US:en
+ENV LC_ALL=en_US.UTF-8
+
+# Expose port for Jupyter.
+EXPOSE 8888
+
+# Copy current directory. 
+COPY . /repo/
+
+# Open Jupyter lab to MUTAG-EGG.
+# CMD ["jupyter", "lab", \ 
+#      "--ip=0.0.0.0", \
+#      "--port=8888", \
+#      "--no-browser", \
+#      "--allow-root", \
+#      "--notebook-dir=/repo/results/MUTAG"]
