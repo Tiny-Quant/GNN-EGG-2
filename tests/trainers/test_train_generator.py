@@ -5,7 +5,7 @@ from torch_geometric.data import Data, Batch
 from torch_geometric.nn import GCNConv, global_mean_pool
 
 from src.models.generator import GraphGenerator
-from src.models.losses import SoftContrastiveEmbedLoss, EdgePenalty
+from src.models.losses import SoftContrastiveEmbedLoss, EdgePenalty, GraphDistanceContrastiveLoss
 from src.trainers.train_generator import GeneratorTrainer, GenTrainConfig, precompute_class_means
 from src.utils.embeddings import compute_classwise_means
 
@@ -39,7 +39,8 @@ def make_toy_dataset(num_graphs=6, num_nodes=5, in_dim=8):
         # fully-connected undirected graph
         edge_index = torch.combinations(torch.arange(num_nodes), r=2).T
         edge_index = torch.cat([edge_index, edge_index.flip(0)], dim=1)
-        data_list.append(Data(x=x, edge_index=edge_index))
+        y = torch.tensor([i % 2], dtype=torch.long)
+        data_list.append(Data(x=x, edge_index=edge_index, y=y))
     return data_list
 
 
@@ -114,6 +115,31 @@ def test_generator_trainer_step_computes_gradients():
     # verify that generator parameters got grads
     grads = [p.grad for p in gen.parameters() if p.grad is not None]
     assert len(grads) > 0, "Expected gradients on generator parameters"
+
+
+def test_graph_distance_contrastive_loss_runs():
+    dataset = make_toy_dataset(num_graphs=6)
+    class_graphs = {
+        0: dataset[0:3],
+        1: dataset[3:6],
+    }
+
+    loss_fn = GraphDistanceContrastiveLoss(
+        metrics=[{"name": "adjacency", "margin": 0.1, "sample_size": 1}],
+        class_graphs=class_graphs,
+        distance_models={},
+        device=torch.device("cpu"),
+        max_nodes=5,
+        thresh=0.5,
+    )
+
+    gen_out = {
+        "adj": torch.sigmoid(torch.randn(2, 5, 5)),
+        "cont_node": torch.randn(2, 5, 8),
+    }
+
+    loss = loss_fn(gen_out, target_class=0)
+    assert torch.isfinite(loss)
 
 
 def test_edge_penalty_behavior():

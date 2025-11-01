@@ -24,12 +24,15 @@ but still pass gradients to the generator through adj.
 
 from __future__ import annotations
 
-from typing import Dict, Iterable, List, Optional
+import random
+from dataclasses import dataclass
+from typing import Callable, Dict, Iterable, List, Optional, Sequence
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch_geometric.data import Data, Batch
+from torch_geometric.utils import to_dense_adj
 
 
 # ---------------------------
@@ -323,3 +326,244 @@ class PredictionConfidenceLoss(nn.Module):
         logits = self._call_explainee(batch)           # [B, C]
         log_probs = F.log_softmax(logits, dim=-1)      # [B, C]
         return -log_probs[:, self.target_class].mean()
+
+
+# ---------------------------
+# Graph distance contrastive loss
+# ---------------------------
+
+
+@dataclass
+class DistanceMetricSpec:
+    """Configuration for a single distance metric term."""
+
+    name: str
+    weight: float = 1.0
+    pull_weight: float = 1.0
+    push_weight: float = 1.0
+    margin: float = 1.0
+    sample_size: int = 1
+    model_key: Optional[str] = None
+
+
+def _adjacency_distance(
+    batch_generated: Batch,
+    batch_reference: Batch,
+    max_nodes: int,
+) -> torch.Tensor:
+    """Return per-graph Frobenius distance between dense adjacencies."""
+
+    adj_gen = to_dense_adj(
+        batch_generated.edge_index,
+        batch=batch_generated.batch,
+        max_num_nodes=max_nodes,
+    ).squeeze(1)
+    adj_ref = to_dense_adj(
+        batch_reference.edge_index,
+        batch=batch_reference.batch,
+        max_num_nodes=max_nodes,
+    ).squeeze(1)
+
+    if adj_gen.shape != adj_ref.shape:
+        raise RuntimeError(
+            f"Adjacency shapes do not match: {adj_gen.shape} vs {adj_ref.shape}"
+        )
+
+    diff = adj_gen - adj_ref
+    return diff.view(diff.size(0), -1).pow(2).mean(dim=1)
+
+
+class _DistanceMetric:
+    """Helper encapsulating sampling + metric evaluation."""
+
+    def __init__(
+        self,
+        spec: DistanceMetricSpec,
+        distance_fn: Callable[[Batch, Batch], torch.Tensor],
+        device: torch.device,
+        max_nodes: int,
+    ) -> None:
+        self.spec = spec
+        self.distance_fn = distance_fn
+        self.device = device
+        self.max_nodes = max_nodes
+
+    def _build_batch(self, graphs: Sequence[Data]) -> Batch:
+        batch = Batch.from_data_list(graphs)
+        return batch.to(self.device)
+
+    def compute(
+        self,
+        gen_batch: Batch,
+        target_class: int,
+        class_graphs: Dict[int, Sequence[Data]],
+    ) -> Dict[str, torch.Tensor]:
+        B = gen_batch.num_graphs
+        if B == 0:
+            zero = torch.zeros((), device=self.device)
+            return {"total": zero, "pull": zero, "push": zero, "pull_raw": zero, "push_raw": zero}
+
+        pull_vals = []
+        for _ in range(max(1, int(self.spec.sample_size))):
+            refs = _sample_graphs(class_graphs, target_class, B)
+            ref_batch = self._build_batch(refs)
+            pull_vals.append(self.distance_fn(gen_batch, ref_batch))
+
+        pull_stack = torch.stack(pull_vals, dim=0)  # [S, B]
+        pull_mean = pull_stack.mean()
+
+        other_classes = [c for c in class_graphs.keys() if c != target_class and len(class_graphs[c]) > 0]
+        if other_classes:
+            push_vals = []
+            for _ in range(max(1, int(self.spec.sample_size))):
+                cls = random.choice(other_classes)
+                refs = _sample_graphs(class_graphs, cls, B)
+                ref_batch = self._build_batch(refs)
+                push_vals.append(self.distance_fn(gen_batch, ref_batch))
+            push_stack = torch.stack(push_vals, dim=0)
+            push_dist = push_stack.mean()
+            push_penalty = F.relu(self.spec.margin - push_stack).mean()
+        else:
+            push_stack = None
+            push_dist = torch.zeros((), device=self.device)
+            push_penalty = torch.zeros((), device=self.device)
+
+        pull_component = self.spec.weight * self.spec.pull_weight * pull_mean
+        push_component = self.spec.weight * self.spec.push_weight * push_penalty
+        total = pull_component + push_component
+
+        result = {
+            "total": total,
+            "pull": pull_component,
+            "push": push_component,
+            "pull_raw": pull_mean.detach(),
+            "push_raw": push_dist.detach(),
+        }
+
+        if push_stack is not None:
+            result["push_stack"] = push_stack.detach()
+
+        return result
+
+
+def _build_metric(
+    spec_dict: Dict[str, object],
+    *,
+    distance_models: Dict[str, nn.Module],
+    device: torch.device,
+    max_nodes: int,
+) -> _DistanceMetric:
+    spec = DistanceMetricSpec(**spec_dict)
+
+    name = spec.name.lower()
+    if name == "simgnn":
+        key = spec.model_key or "simgnn"
+        if key not in distance_models:
+            raise ValueError(
+                f"Distance metric '{name}' requires model '{key}', but it was not provided."
+            )
+        model = distance_models[key]
+        model = model.to(device).eval()
+        for param in model.parameters():
+            param.requires_grad_(False)
+
+        def fn(gen_batch: Batch, ref_batch: Batch) -> torch.Tensor:
+            return F.relu(model(gen_batch, ref_batch))
+
+    elif name in {"adjacency", "adjacency_l2", "adjacency_fro"}:
+
+        def fn(gen_batch: Batch, ref_batch: Batch) -> torch.Tensor:
+            return _adjacency_distance(gen_batch, ref_batch, max_nodes=max_nodes)
+
+    else:
+        raise ValueError(f"Unknown distance metric: {spec.name}")
+
+    return _DistanceMetric(spec, fn, device=device, max_nodes=max_nodes)
+
+
+def _sample_graphs(
+    class_graphs: Dict[int, Sequence[Data]],
+    class_idx: int,
+    k: int,
+) -> List[Data]:
+    pool = class_graphs.get(class_idx, [])
+    if not pool:
+        raise ValueError(f"No reference graphs available for class {class_idx}")
+    choices = [pool[random.randrange(len(pool))] for _ in range(k)]
+    # clone to avoid in-place modifications during batching
+    return [data.clone() for data in choices]
+
+
+class GraphDistanceContrastiveLoss(nn.Module):
+    """
+    Contrastive loss that pulls generated graphs toward the target class while
+    pushing them away from other classes using graph distance metrics.
+
+    Each metric contributes its own pull (attraction) and push (repulsion)
+    components, allowing multiple metrics with individual weights.
+    """
+
+    def __init__(
+        self,
+        *,
+        metrics: Sequence[Dict[str, object]],
+        class_graphs: Dict[int, Sequence[Data]],
+        distance_models: Optional[Dict[str, nn.Module]],
+        device: torch.device,
+        max_nodes: int,
+        thresh: float = 0.5,
+    ) -> None:
+        super().__init__()
+        self.device = device
+        self.thresh = float(thresh)
+        self.class_graphs = {
+            cls: [g.clone() for g in graphs]
+            for cls, graphs in class_graphs.items()
+        }
+        for graphs in self.class_graphs.values():
+            for data in graphs:
+                if data.x is not None:
+                    data.x = data.x.clone()
+
+        self.metrics = [
+            _build_metric(
+                spec,
+                distance_models=distance_models or {},
+                device=device,
+                max_nodes=max_nodes,
+            )
+            for spec in metrics
+        ]
+
+    def forward_components(self, gen_out: Dict[str, torch.Tensor], target_class: int) -> Dict[str, torch.Tensor]:
+        if not self.metrics:
+            zero = torch.zeros((), device=self.device)
+            return {"total": zero, "pull": zero, "push": zero, "metrics": {}}
+
+        batch = _build_data_from_gen_output(gen_out, thresh=self.thresh)
+        batch = batch.to(self.device)
+
+        totals, pulls, pushes = [], [], []
+        metric_logs: Dict[str, Dict[str, torch.Tensor]] = {}
+
+        for metric in self.metrics:
+            comps = metric.compute(batch, target_class, self.class_graphs)
+            totals.append(comps["total"])
+            pulls.append(comps["pull"])
+            pushes.append(comps["push"])
+            metric_logs[metric.spec.name] = comps
+
+        total = torch.stack(totals).sum()
+        pull = torch.stack(pulls).sum()
+        push = torch.stack(pushes).sum()
+
+        return {
+            "total": total,
+            "pull": pull,
+            "push": push,
+            "metrics": metric_logs,
+        }
+
+    def forward(self, gen_out: Dict[str, torch.Tensor], target_class: int) -> torch.Tensor:
+        comps = self.forward_components(gen_out, target_class)
+        return comps["total"]

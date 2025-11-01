@@ -19,6 +19,8 @@ import torch
 import random
 import numpy as np
 from pathlib import Path
+from collections import defaultdict
+from typing import Dict, Optional
 from sklearn.model_selection import train_test_split
 from torch_geometric.loader import DataLoader
 
@@ -28,6 +30,7 @@ from src.trainers.train_generator import train_generator
 from src.models.explainee_gnn import ExplaineeGIN
 from src.models.adapter import GeneratorAdapter
 from src.utils.embeddings import compute_classwise_means
+from src.models.sim_gnn import SimGNN
 
 
 # ---------------------------------------------------------------------
@@ -180,11 +183,22 @@ def main():
     distance_ckpt = Path(distance_cfg["save_path"])
     model_name = distance_cfg["model_name"].lower()
 
+    distance_models: Dict[str, torch.nn.Module] = {}
     if model_name == "simgnn":
+        simgnn_model: Optional[SimGNN] = None
+        in_dim = dataset[0].x.size(1)
         if distance_ckpt.exists() and not args.retrain:
-            print(f"📂 Found SimGNN checkpoint at {distance_ckpt}, skipping training.\n")
+            print(f"📂 Found SimGNN checkpoint at {distance_ckpt}, loading...\n")
+            simgnn_model = SimGNN(
+                in_dim,
+                hidden_dim=distance_cfg["hidden_dim"],
+                use_tensor=distance_cfg.get("use_tensor", False),
+                tensor_channels=distance_cfg.get("tensor_channels", 8),
+            )
+            state = torch.load(distance_ckpt, map_location=device, weights_only=False)
+            simgnn_model.load_state_dict(state)
         else:
-            train_distance(
+            simgnn_model, _ = train_distance(
                 dataset_name=cfg["dataset"]["name"],
                 data_path=distance_cfg["data_path"],
                 hidden_dim=distance_cfg["hidden_dim"],
@@ -198,6 +212,12 @@ def main():
                 device=device,
                 overwrite_data=False,
             )
+
+        if simgnn_model is not None:
+            simgnn_model = simgnn_model.to(device).eval()
+            for param in simgnn_model.parameters():
+                param.requires_grad_(False)
+            distance_models["simgnn"] = simgnn_model
     else:
         print(f"⚡ Skipping distance model stage (model_name={model_name}).\n")
 
@@ -233,6 +253,25 @@ def main():
     )
 
     gen_cfg = cfg.get("generator", {})
+    distance_gen_cfg = gen_cfg.get("distance", {})
+    lambda_distance = gen_cfg.get("lambda_distance", distance_gen_cfg.get("lambda", 1.0))
+    distance_metrics = distance_gen_cfg.get("metrics", [])
+    distance_thresh = distance_gen_cfg.get("thresh", 0.5)
+
+    filtered_metrics = []
+    for spec in distance_metrics:
+        name = str(spec.get("name", "")).lower()
+        if name == "simgnn" and "simgnn" not in distance_models:
+            print("⚠️ Distance metric 'simgnn' requested but SimGNN model is unavailable. Skipping this term.")
+            continue
+        filtered_metrics.append(spec)
+    distance_metrics = filtered_metrics
+
+    class_graphs = defaultdict(list)
+    for graph in dataset:
+        label = int(graph.y.item()) if hasattr(graph, "y") else 0
+        class_graphs[label].append(graph)
+
     for class_idx in range(num_classes):
         ckpt_path = Path(gen_cfg["save_path"]).parent / f"generator_class{class_idx}.pt"
         ckpt_path.parent.mkdir(parents=True, exist_ok=True)
@@ -264,6 +303,11 @@ def main():
             allow_self_loops=gen_cfg.get("allow_self_loops", False),
             lambda_edge=gen_cfg.get("lambda_edge", 0.1),
             lambda_pred=gen_cfg.get("lambda_pred", 1.0),
+            lambda_distance=lambda_distance,
+            distance_metrics=distance_metrics,
+            distance_models=distance_models,
+            class_graphs=dict(class_graphs),
+            distance_thresh=distance_thresh,
             log_every=gen_cfg.get("log_every", 20),
         )
 
