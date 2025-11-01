@@ -3,8 +3,7 @@ Trainer for class-conditional GraphGenerator using:
   - Soft contrastive embedding loss (pull-to-target, push-from-others)
   - Prediction confidence loss (maximize explainee's prob for target class)
   - Edge sparsity penalty
-
-Distance-based terms (SimGNN, etc.) can be added later.
+  - Optional graph-distance contrastive terms (e.g., SimGNN, adjacency)
 
 Workflow:
   1. You train an explainee GNN separately and save it.
@@ -30,6 +29,7 @@ from src.models.losses import (
     EdgePenalty,
     SoftContrastiveEmbedLoss,
     PredictionConfidenceLoss,
+    GraphDistanceContrastiveLoss,
 )
 from src.utils.embeddings import discover_embedding_layers
 
@@ -46,6 +46,7 @@ class GenTrainConfig:
     batch_size: int = 1
     lambda_edge: float = 1.0
     lambda_pred: float = 1.0
+    lambda_distance: float = 1.0
     edge_thresh: float = 0.5  # how we binarize adj in SoftContrastiveEmbedLoss/PredictionConfidenceLoss
     layer_names: Optional[Sequence[str]] = None
     save_dir: str = "checkpoints/generators"
@@ -62,7 +63,7 @@ class GeneratorTrainer:
     Handles the training loop for a single GraphGenerator targeting one class.
 
     Loss:
-        L = (pull + push) + lambda_pred * L_pred + lambda_edge * L_edge
+        L = (pull + push) + lambda_pred * L_pred + lambda_edge * L_edge + lambda_distance * L_distance
 
     explainee is frozen the entire time.
     """
@@ -77,6 +78,8 @@ class GeneratorTrainer:
         lambda_pred: float = 1.0,
         edge_thresh: float = 0.5,
         layer_names: Optional[Sequence[str]] = None,
+        distance_loss: Optional[GraphDistanceContrastiveLoss] = None,
+        lambda_distance: float = 1.0,
     ):
         # freeze explainee
         self.explainee = explainee.to(device).eval()
@@ -99,6 +102,8 @@ class GeneratorTrainer:
         self.lambda_edge = float(lambda_edge)
         self.lambda_pred = float(lambda_pred)
         self.edge_thresh = float(edge_thresh)
+        self.distance_loss = distance_loss
+        self.lambda_distance = float(lambda_distance)
 
         # last-logged components
         self._last_log = None  # filled after first step
@@ -149,8 +154,27 @@ class GeneratorTrainer:
         loss_push = embed_comps["push"]
         loss_pred = self._pred_loss(out, target_class)
         loss_edge = self.edge_pen(out["adj"])
+        loss_distance = torch.tensor(0.0, device=self.device)
+        dist_logs = {}
+        if self.distance_loss is not None:
+            dist_comps = self.distance_loss.forward_components(out, target_class)
+            loss_distance = self.lambda_distance * dist_comps["total"]
+            dist_logs = {
+                "distance_total": float(loss_distance.detach()),
+                "distance_pull": float((self.lambda_distance * dist_comps["pull"]).detach()),
+                "distance_push": float((self.lambda_distance * dist_comps["push"]).detach()),
+            }
 
-        total_loss = (loss_pull + loss_push) + self.lambda_pred * loss_pred + self.lambda_edge * loss_edge
+            for name, comps in dist_comps.get("metrics", {}).items():
+                if "total" in comps:
+                    dist_logs[f"distance/{name}"] = float((self.lambda_distance * comps["total"]).detach())
+
+        total_loss = (
+            (loss_pull + loss_push)
+            + self.lambda_pred * loss_pred
+            + self.lambda_edge * loss_edge
+            + loss_distance
+        )
         total_loss.backward()
 
         # cache scalar logs
@@ -161,6 +185,7 @@ class GeneratorTrainer:
             "pred": float(loss_pred.detach()),
             "edge": float(loss_edge.detach()),
         }
+        self._last_log.update(dist_logs)
         return total_loss
 
     def train(self, generator: GraphGenerator, cfg: GenTrainConfig) -> None:
@@ -222,6 +247,11 @@ def train_generator(
     allow_self_loops: bool = False,
     lambda_edge: float = 0.1,
     lambda_pred: float = 1.0,
+    lambda_distance: float = 1.0,
+    distance_metrics: Optional[Sequence[Dict[str, object]]] = None,
+    distance_models: Optional[Dict[str, nn.Module]] = None,
+    class_graphs: Optional[Dict[int, Sequence[object]]] = None,
+    distance_thresh: float = 0.5,
     log_every: int = 20,
 ) -> None:
     """
@@ -241,7 +271,19 @@ def train_generator(
         batch_size=batch_size,
     )
 
-    # 2. wrap config
+    # 2. optional distance-based supervision
+    distance_loss = None
+    if distance_metrics and class_graphs:
+        distance_loss = GraphDistanceContrastiveLoss(
+            metrics=distance_metrics,
+            class_graphs=class_graphs,
+            distance_models=distance_models,
+            device=device,
+            max_nodes=max_nodes,
+            thresh=distance_thresh,
+        )
+
+    # 3. wrap config
     cfg = GenTrainConfig(
         target_class=target_class,
         epochs=steps,
@@ -249,12 +291,13 @@ def train_generator(
         batch_size=batch_size,
         lambda_edge=lambda_edge,
         lambda_pred=lambda_pred,
+        lambda_distance=lambda_distance,
         save_dir=str(Path(save_path).parent),
         save_name=Path(save_path).name,
         log_every=log_every,
     )
 
-    # 3. trainer
+    # 4. trainer
     trainer = GeneratorTrainer(
         explainee=explainee,
         num_classes=num_classes,
@@ -264,9 +307,11 @@ def train_generator(
         lambda_pred=lambda_pred,
         edge_thresh=0.5,
         layer_names=None,  # auto-discover shared layers
+        distance_loss=distance_loss,
+        lambda_distance=lambda_distance,
     )
 
-    # 4. train + save
+    # 5. train + save
     trainer.train(generator, cfg)
 
 
