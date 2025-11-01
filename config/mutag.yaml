@@ -65,6 +65,26 @@ generator:
   symmetric_adj: true
   allow_self_loops: false
   save_path: "checkpoints/generators/generator-classX.pt"
+  lambda_pull: 1.0
+  lambda_push: 1.0
+  lambda_pred: 1.0
+  lambda_edge: 0.1
+  lambda_distance: 0.5
+  distance:
+    thresh: 0.5
+    metrics:
+      - name: simgnn
+        weight: 1.0
+        pull_weight: 1.0
+        push_weight: 1.0
+        margin: 0.5
+        sample_size: 2
+      - name: adjacency
+        weight: 0.25
+        pull_weight: 1.0
+        push_weight: 1.0
+        margin: 0.3
+        sample_size: 1
 
 
 # ---------------------------------------------------------------------

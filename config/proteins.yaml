@@ -65,6 +65,31 @@ generator:
   distance_metric: simgnn
   save_path: models/generators/gnn_egg_proteins.pt
   checkpoint_dir: checkpoints/generators/
+  steps: 2500
+  batch_size: 1
+  temperature: 0.9
+  symmetric_adj: true
+  allow_self_loops: false
+  lambda_pull: 1.0
+  lambda_push: 1.0
+  lambda_pred: 1.0
+  lambda_edge: 0.05
+  lambda_distance: 0.5
+  distance:
+    thresh: 0.5
+    metrics:
+      - name: simgnn
+        weight: 1.0
+        pull_weight: 1.0
+        push_weight: 1.0
+        margin: 0.6
+        sample_size: 2
+      - name: adjacency
+        weight: 0.2
+        pull_weight: 1.0
+        push_weight: 1.0
+        margin: 0.4
+        sample_size: 1
 
 # ---------------------------------------------------------------------
 # Logging / evaluation options
