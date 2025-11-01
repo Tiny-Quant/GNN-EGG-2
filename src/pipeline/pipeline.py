@@ -301,6 +301,8 @@ def main():
             temperature=gen_cfg.get("temperature", 1.0),
             symmetric_adj=gen_cfg.get("symmetric_adj", True),
             allow_self_loops=gen_cfg.get("allow_self_loops", False),
+            lambda_pull=gen_cfg.get("lambda_pull", 1.0),
+            lambda_push=gen_cfg.get("lambda_push", 1.0),
             lambda_edge=gen_cfg.get("lambda_edge", 0.1),
             lambda_pred=gen_cfg.get("lambda_pred", 1.0),
             lambda_distance=lambda_distance,

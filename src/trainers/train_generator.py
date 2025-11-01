@@ -44,6 +44,8 @@ class GenTrainConfig:
     epochs: int = 200
     lr: float = 1e-3
     batch_size: int = 1
+    lambda_pull: float = 1.0
+    lambda_push: float = 1.0
     lambda_edge: float = 1.0
     lambda_pred: float = 1.0
     lambda_distance: float = 1.0
@@ -63,7 +65,9 @@ class GeneratorTrainer:
     Handles the training loop for a single GraphGenerator targeting one class.
 
     Loss:
-        L = (pull + push) + lambda_pred * L_pred + lambda_edge * L_edge + lambda_distance * L_distance
+        L = lambda_pull * pull + lambda_push * push
+            + lambda_pred * L_pred + lambda_edge * L_edge
+            + lambda_distance * L_distance
 
     explainee is frozen the entire time.
     """
@@ -74,6 +78,8 @@ class GeneratorTrainer:
         num_classes: int,
         classwise_means: Dict[str, torch.Tensor],
         device: torch.device,
+        lambda_pull: float = 1.0,
+        lambda_push: float = 1.0,
         lambda_edge: float = 1.0,
         lambda_pred: float = 1.0,
         edge_thresh: float = 0.5,
@@ -99,6 +105,8 @@ class GeneratorTrainer:
             self.layer_names = list(layer_names)
 
         self.edge_pen = EdgePenalty()
+        self.lambda_pull = float(lambda_pull)
+        self.lambda_push = float(lambda_push)
         self.lambda_edge = float(lambda_edge)
         self.lambda_pred = float(lambda_pred)
         self.edge_thresh = float(edge_thresh)
@@ -150,40 +158,62 @@ class GeneratorTrainer:
 
         # components
         embed_comps = self._embed_components(out, target_class)
-        loss_pull = embed_comps["pull"]
-        loss_push = embed_comps["push"]
-        loss_pred = self._pred_loss(out, target_class)
-        loss_edge = self.edge_pen(out["adj"])
-        loss_distance = torch.tensor(0.0, device=self.device)
+        loss_pull_raw = embed_comps["pull"]
+        loss_push_raw = embed_comps["push"]
+        loss_pred_raw = self._pred_loss(out, target_class)
+        loss_edge_raw = self.edge_pen(out["adj"])
+
+        weighted_pull = self.lambda_pull * loss_pull_raw
+        weighted_push = self.lambda_push * loss_push_raw
+        weighted_pred = self.lambda_pred * loss_pred_raw
+        weighted_edge = self.lambda_edge * loss_edge_raw
+
+        loss_distance_raw = torch.zeros((), device=self.device)
+        weighted_distance = torch.zeros((), device=self.device)
         dist_logs = {}
         if self.distance_loss is not None:
             dist_comps = self.distance_loss.forward_components(out, target_class)
-            loss_distance = self.lambda_distance * dist_comps["total"]
+            loss_distance_raw = dist_comps["total"]
+            weighted_distance = self.lambda_distance * loss_distance_raw
+
             dist_logs = {
-                "distance_total": float(loss_distance.detach()),
+                "distance": float(weighted_distance.detach()),
+                "distance_raw": float(loss_distance_raw.detach()),
                 "distance_pull": float((self.lambda_distance * dist_comps["pull"]).detach()),
+                "distance_pull_raw": float(dist_comps["pull"].detach()),
                 "distance_push": float((self.lambda_distance * dist_comps["push"]).detach()),
+                "distance_push_raw": float(dist_comps["push"].detach()),
             }
 
+            metric_details = {}
             for name, comps in dist_comps.get("metrics", {}).items():
-                if "total" in comps:
-                    dist_logs[f"distance/{name}"] = float((self.lambda_distance * comps["total"]).detach())
+                if "total" not in comps:
+                    continue
+                metric_details[name] = {
+                    "total": float((self.lambda_distance * comps["total"]).detach()),
+                    "total_raw": float(comps["total"].detach()),
+                    "pull": float((self.lambda_distance * comps["pull"]).detach()) if "pull" in comps else None,
+                    "pull_raw": float(comps["pull"].detach()) if "pull" in comps else None,
+                    "push": float((self.lambda_distance * comps["push"]).detach()) if "push" in comps else None,
+                    "push_raw": float(comps["push"].detach()) if "push" in comps else None,
+                }
+            if metric_details:
+                dist_logs["distance_metrics"] = metric_details
 
-        total_loss = (
-            (loss_pull + loss_push)
-            + self.lambda_pred * loss_pred
-            + self.lambda_edge * loss_edge
-            + loss_distance
-        )
+        total_loss = weighted_pull + weighted_push + weighted_pred + weighted_edge + weighted_distance
         total_loss.backward()
 
         # cache scalar logs
         self._last_log = {
             "total": float(total_loss.detach()),
-            "pull": float(loss_pull.detach()),
-            "push": float(loss_push.detach()),
-            "pred": float(loss_pred.detach()),
-            "edge": float(loss_edge.detach()),
+            "pull": float(weighted_pull.detach()),
+            "push": float(weighted_push.detach()),
+            "pred": float(weighted_pred.detach()),
+            "edge": float(weighted_edge.detach()),
+            "pull_raw": float(loss_pull_raw.detach()),
+            "push_raw": float(loss_push_raw.detach()),
+            "pred_raw": float(loss_pred_raw.detach()),
+            "edge_raw": float(loss_edge_raw.detach()),
         }
         self._last_log.update(dist_logs)
         return total_loss
@@ -207,14 +237,51 @@ class GeneratorTrainer:
             if epoch % max(1, cfg.log_every) == 0:
                 log = self._last_log or {
                     "total": float(total_loss.detach()),
-                    "pull": 0.0, "push": 0.0, "pred": 0.0, "edge": 0.0
+                    "pull": 0.0,
+                    "push": 0.0,
+                    "pred": 0.0,
+                    "edge": 0.0,
+                    "pull_raw": 0.0,
+                    "push_raw": 0.0,
+                    "pred_raw": 0.0,
+                    "edge_raw": 0.0,
                 }
+
+                components = [
+                    f"pull={log['pull']:.4f}",
+                    f"push={log['push']:.4f}",
+                    f"pred={log['pred']:.4f}",
+                    f"edge={log['edge']:.4f}",
+                ]
+                if "distance" in log:
+                    components.append(f"distance={log['distance']:.4f}")
+
                 print(
                     f"[Gen|class={cfg.target_class}] epoch {epoch:04d} | "
-                    f"total={log['total']:.4f} "
-                    f"(pull={log['pull']:.4f}, push={log['push']:.4f}, "
-                    f"pred={log['pred']:.4f}, edge={log['edge']:.4f})"
+                    f"total={log['total']:.4f} (" + ", ".join(components) + ")"
                 )
+
+                raw_components = [
+                    f"pull_raw={log['pull_raw']:.4f}",
+                    f"push_raw={log['push_raw']:.4f}",
+                    f"pred_raw={log['pred_raw']:.4f}",
+                    f"edge_raw={log['edge_raw']:.4f}",
+                ]
+                if "distance_raw" in log:
+                    raw_components.append(f"distance_raw={log['distance_raw']:.4f}")
+                print("    ↳ raw components: " + ", ".join(raw_components))
+
+                if isinstance(log.get("distance_metrics"), dict):
+                    for name, comps in log["distance_metrics"].items():
+                        details = []
+                        if comps.get("total") is not None:
+                            details.append(f"total={comps['total']:.4f} (raw={comps['total_raw']:.4f})")
+                        if comps.get("pull") is not None:
+                            details.append(f"pull={comps['pull']:.4f} (raw={comps['pull_raw']:.4f})")
+                        if comps.get("push") is not None:
+                            details.append(f"push={comps['push']:.4f} (raw={comps['push_raw']:.4f})")
+                        if details:
+                            print(f"    ↳ distance/{name}: " + ", ".join(details))
 
         torch.save(generator.state_dict(), ckpt_path)
         print(f"✅ Saved generator for class {cfg.target_class} to: {ckpt_path}")
@@ -247,6 +314,8 @@ def train_generator(
     allow_self_loops: bool = False,
     lambda_edge: float = 0.1,
     lambda_pred: float = 1.0,
+    lambda_pull: float = 1.0,
+    lambda_push: float = 1.0,
     lambda_distance: float = 1.0,
     distance_metrics: Optional[Sequence[Dict[str, object]]] = None,
     distance_models: Optional[Dict[str, nn.Module]] = None,
@@ -289,6 +358,8 @@ def train_generator(
         epochs=steps,
         lr=lr,
         batch_size=batch_size,
+        lambda_pull=lambda_pull,
+        lambda_push=lambda_push,
         lambda_edge=lambda_edge,
         lambda_pred=lambda_pred,
         lambda_distance=lambda_distance,
@@ -303,6 +374,8 @@ def train_generator(
         num_classes=num_classes,
         classwise_means=classwise_means,
         device=device,
+        lambda_pull=lambda_pull,
+        lambda_push=lambda_push,
         lambda_edge=lambda_edge,
         lambda_pred=lambda_pred,
         edge_thresh=0.5,
